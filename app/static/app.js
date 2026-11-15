@@ -201,4 +201,191 @@
       });
     });
   }
+
+  // ---- 模块 7/8：分片续传、整批隔离与原子切换
+  var chunkFile = qs('#chunk-file');
+  var chunkVersion = qs('#chunk-version');
+  var chunkSize = qs('#chunk-size');
+  var chunkAmounts = qs('#chunk-amounts');
+  var chunkBtn = qs('#chunk-upload-btn');
+  var finalizeBtn = qs('#chunk-finalize-btn');
+  var statusBtn = qs('#chunk-status-btn');
+  var chunkProgress = qs('#chunk-progress');
+  var chunkResult = qs('#chunk-result');
+  var chunkError = qs('#chunk-error');
+
+  function sha256Hex(buf) {
+    return crypto.subtle.digest('SHA-256', buf).then(function (digest) {
+      return Array.prototype.map.call(new Uint8Array(digest), function (b) {
+        return ('00' + b.toString(16)).slice(-2);
+      }).join('');
+    });
+  }
+
+  function parseAmountsFromCsv(text) {
+    var lines = text.split(/\r?\n/).filter(function (l) { return l.trim().length; });
+    if (lines.length < 2) return [];
+    var header = lines[0].split(',').map(function (c) { return c.trim(); });
+    var idx = {};
+    header.forEach(function (h, i) { idx[h] = i; });
+    var buckets = {};
+    var order = [];
+    for (var i = 1; i < lines.length; i++) {
+      var cells = lines[i].split(',');
+      var site = (cells[idx.site] || '').trim();
+      if (!site) continue;
+      if (!buckets[site]) { buckets[site] = { site: site, amount_cents: 0, qty: 0, row_count: 0 }; order.push(site); }
+      buckets[site].amount_cents += Math.round(parseFloat(cells[idx.amount]) * 100);
+      buckets[site].qty += parseInt(cells[idx.qty], 10);
+      buckets[site].row_count += 1;
+    }
+    return order.map(function (s) { return buckets[s]; });
+  }
+
+  function showChunkError(err) {
+    if (!chunkError) return;
+    chunkError.hidden = false;
+    chunkError.textContent = '分片流程失败：' + (err && err.message ? err.message : String(err));
+  }
+
+  function renderSession(data) {
+    if (!chunkResult) return;
+    var statusTag = {
+      open: 'ok', quarantined: 'err', published: 'ok', stale_rejected: 'err'
+    }[data.status] || '';
+    var html = '<p>会话 <code>' + esc((data.file_id || '').slice(0, 16)) + '…</code>'
+      + ' 状态 <span class="tag ' + statusTag + '">' + esc(data.status) + '</span>'
+      + ' 已收 ' + esc(data.received_count) + '/' + esc(data.total_segments) + ' 段</p>';
+    if (data.gaps && data.gaps.length) {
+      html += '<p class="muted">缺口段号：' + esc(data.gaps.join(', ')) + '</p>';
+    }
+    if (data.quarantine_reason) {
+      html += '<p style="color:var(--red,#b00020)">隔离原因：' + esc(data.quarantine_reason) + '</p>';
+    }
+    if (data.mismatch && data.mismatch.length) {
+      html += '<table><thead><tr><th>错配码</th><th>依据</th></tr></thead><tbody>';
+      data.mismatch.slice(0, 10).forEach(function (m) {
+        html += '<tr><td><code>' + esc(m.code) + '</code></td><td>' + esc(m.message) + '</td></tr>';
+      });
+      html += '</tbody></table>';
+    }
+    if (data.batch_id) html += '<p>发布批次：<code>' + esc(data.batch_id) + '</code></p>';
+    chunkResult.innerHTML = html;
+  }
+
+  async function buildManifest(file) {
+    var buf = await file.arrayBuffer();
+    var bytes = new Uint8Array(buf);
+    var sha = await sha256Hex(buf);
+    var segSize = Math.max(256, parseInt(chunkSize.value, 10) || 65536);
+    var totalSegments = Math.ceil(file.size / segSize);
+    var text = new TextDecoder('utf-8').decode(bytes);
+    var amounts;
+    if (chunkAmounts && chunkAmounts.value.trim()) {
+      amounts = JSON.parse(chunkAmounts.value);
+    } else {
+      amounts = parseAmountsFromCsv(text);
+    }
+    var totalRows = amounts.reduce(function (n, a) { return n + a.row_count; }, 0);
+    var manifest = {
+      filename: file.name,
+      version: (chunkVersion && chunkVersion.value.trim()) || 'v1',
+      sha256: sha,
+      total_size: file.size,
+      segment_size: segSize,
+      total_segments: totalSegments,
+      total_rows: totalRows,
+      amounts: amounts
+    };
+    return { manifest: manifest, bytes: bytes, segSize: segSize };
+  }
+
+  function postForm(url, form) {
+    return fetch(url, { method: 'POST', body: form }).then(function (res) {
+      return res.json().then(function (data) { return { ok: res.ok, status: res.status, data: data }; });
+    });
+  }
+
+  if (chunkBtn) {
+    chunkBtn.addEventListener('click', async function () {
+      if (!chunkFile || !chunkFile.files.length) { showChunkError(new Error('请先选择 CSV 文件')); return; }
+      chunkError.hidden = true;
+      chunkBtn.disabled = true;
+      try {
+        var built = await buildManifest(chunkFile.files[0]);
+        var manifest = built.manifest;
+        var bytes = built.bytes;
+        var segSize = built.segSize;
+
+        var openForm = new FormData();
+        openForm.append('manifest', JSON.stringify(manifest));
+        var opened = await postForm('/api/chunks/session', openForm);
+        if (!opened.ok) throw new Error((opened.data.detail && opened.data.detail.message) || '打开会话失败');
+
+        for (var i = 0; i < manifest.total_segments; i++) {
+          var part = bytes.slice(i * segSize, Math.min((i + 1) * segSize, bytes.length));
+          var partSha = await sha256Hex(part);
+          var form = new FormData();
+          form.append('manifest', JSON.stringify(manifest));
+          form.append('index', String(i));
+          form.append('checksum', partSha);
+          form.append('file', new Blob([part]), i + '.part');
+          var up = await fetch('/api/chunks/segment', { method: 'PUT', body: form })
+            .then(function (res) { return res.json().then(function (d) { return { ok: res.ok, data: d }; }); });
+          if (!up.ok) {
+            renderSession(up.data.session || {});
+            throw new Error(up.data.detail || ('第 ' + i + ' 段被拒收（已整批隔离）'));
+          }
+          if (chunkProgress) {
+            chunkProgress.textContent = '已上传 ' + (i + 1) + '/' + manifest.total_segments + ' 段';
+          }
+        }
+        renderSession((await postForm('/api/chunks/session', openForm)).data);
+        if (chunkProgress) chunkProgress.textContent = '全部片段已收齐，可点「收齐后核对并切换」。';
+      } catch (err) {
+        showChunkError(err);
+      } finally {
+        chunkBtn.disabled = false;
+      }
+    });
+  }
+
+  if (finalizeBtn) {
+    finalizeBtn.addEventListener('click', async function () {
+      if (!chunkFile || !chunkFile.files.length) { showChunkError(new Error('请先选择 CSV 文件')); return; }
+      chunkError.hidden = true;
+      try {
+        var built = await buildManifest(chunkFile.files[0]);
+        var form = new FormData();
+        form.append('manifest', JSON.stringify(built.manifest));
+        var res = await fetch('/api/chunks/finalize', { method: 'POST', body: form });
+        var data = await res.json();
+        if (!res.ok) {
+          if (data.status === 'quarantined') renderSession(data);
+          throw new Error(data.detail || data.reason || ('finalize 返回 ' + res.status));
+        }
+        chunkProgress.textContent = '已一次性切换当前版本（批次 ' + data.batch_id + '）。';
+        var statusForm = new FormData();
+        statusForm.append('manifest', JSON.stringify(built.manifest));
+        renderSession((await postForm('/api/chunks/session', statusForm)).data);
+      } catch (err) {
+        showChunkError(err);
+      }
+    });
+  }
+
+  if (statusBtn) {
+    statusBtn.addEventListener('click', async function () {
+      if (!chunkFile || !chunkFile.files.length) { showChunkError(new Error('请先选择 CSV 文件')); return; }
+      try {
+        var built = await buildManifest(chunkFile.files[0]);
+        var res = await fetch('/api/chunks/session/' + built.manifest.sha256);
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.detail || '会话不存在');
+        renderSession(data);
+      } catch (err) {
+        showChunkError(err);
+      }
+    });
+  }
 })();

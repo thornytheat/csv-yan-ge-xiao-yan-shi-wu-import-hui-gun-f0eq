@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import json
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,7 +12,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import contract, pipeline, report, seed, settings, store
+from . import chunks, contract, manifest as manifest_mod, pipeline, report, seed, settings, store
+from .manifest import ManifestError
 
 MAX_BYTES = 8 * 1024 * 1024
 
@@ -21,6 +23,7 @@ STATUS_HTTP = {
     "rejected": 422,
     "encoding_failed": 400,
     "rolled_back": 500,
+    "guard_rejected": 409,
 }
 
 
@@ -281,6 +284,8 @@ def review(request: Request):
         batches = store.list_batches(conn, limit=30)
         attempts = store.list_attempts(conn, limit=30)
         stats = store.stats(conn)
+        chunk_sessions = store.list_sessions(conn, limit=30)
+        published = store.list_published(conn)
     finally:
         conn.close()
     for attempt in attempts:
@@ -291,6 +296,8 @@ def review(request: Request):
         "batches": batches,
         "attempts": attempts,
         "stats": stats,
+        "chunk_sessions": chunk_sessions,
+        "published": published,
     })
 
 
@@ -371,6 +378,104 @@ def api_batches():
     conn = get_conn()
     try:
         return {"batches": store.list_batches(conn, limit=50), "stats": store.stats(conn)}
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------ 分片续传（模块 7/8）
+
+
+def _parse_manifest(raw: str) -> dict:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"manifest 不是合法 JSON：{exc}")
+    try:
+        return manifest_mod.validate_manifest(payload)
+    except ManifestError as exc:
+        raise HTTPException(status_code=400, detail={"message": exc.message, "field": exc.field})
+
+
+@app.post("/api/chunks/session")
+async def api_chunk_session(manifest: str = Form(...)):
+    """按文件身份打开（或幂等复用）续传会话；重试同一文件不新增会话。"""
+    normalized = _parse_manifest(manifest)
+    conn = get_conn()
+    try:
+        view = chunks.public_session(chunks.open_session(conn, normalized))
+        view["received_indexes"] = store.received_indexes(conn, normalized["file_id"])
+        return view
+    finally:
+        conn.close()
+
+
+@app.put("/api/chunks/segment")
+async def api_chunk_segment(
+    manifest: str = Form(...),
+    index: int = Form(...),
+    checksum: str = Form(...),
+    file: UploadFile = File(...),
+):
+    """接收单个片段；坏段/来源不一致返回 409 并整批隔离，坏字节不落暂存。"""
+    normalized = _parse_manifest(manifest)
+    data = await file.read()
+    if len(data) > settings.MAX_CHUNK_BYTES:
+        raise HTTPException(status_code=413,
+                            detail=f"单段超过上限 {settings.MAX_CHUNK_BYTES} 字节。")
+    conn = get_conn()
+    try:
+        try:
+            view = chunks.receive_segment(conn, normalized, index, checksum, data)
+        except chunks.ChunkConflict as exc:
+            status = 409
+            return JSONResponse(
+                {"detail": exc.message, "code": exc.code, **exc.extra,
+                 "session": chunks.session_status(conn, normalized["file_id"])
+                 if store.get_session(conn, normalized["file_id"]) else None},
+                status_code=status,
+            )
+        view["received_indexes"] = store.received_indexes(conn, normalized["file_id"])
+        return view
+    finally:
+        conn.close()
+
+
+@app.post("/api/chunks/finalize")
+async def api_chunk_finalize(manifest: str = Form(...)):
+    """收齐后核对并一次性原子切换；缺段/错配/清单不符 → 隔离（409），不动当前版本。"""
+    normalized = _parse_manifest(manifest)
+    conn = get_conn()
+    try:
+        try:
+            result = chunks.finalize(conn, normalized)
+        except chunks.ChunkConflict as exc:
+            return JSONResponse(
+                {"detail": exc.message, "code": exc.code, **exc.extra}, status_code=409)
+        if result["status"] == "quarantined":
+            return JSONResponse(result, status_code=409)
+        return result
+    finally:
+        conn.close()
+
+
+@app.get("/api/chunks/session/{file_id}")
+def api_chunk_session_status(file_id: str):
+    conn = get_conn()
+    try:
+        try:
+            return chunks.session_status(conn, file_id)
+        except chunks.ChunkConflict as exc:
+            raise HTTPException(status_code=404, detail=exc.message)
+    finally:
+        conn.close()
+
+
+@app.get("/api/published")
+def api_published():
+    """当前对外生效的文件版本指针（一次切换只改这里，失败保留上一版）。"""
+    conn = get_conn()
+    try:
+        return {"published": store.list_published(conn)}
     finally:
         conn.close()
 

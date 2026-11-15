@@ -20,6 +20,10 @@ def file_sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+class _GuardRejected(Exception):
+    """事务内清单/版本守卫失败：触发整体回滚，保留上一版当前结果。"""
+
+
 def _new_batch_id(conn: sqlite3.Connection, sha256: str, forced: bool) -> str:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     base = f"B-{stamp}"
@@ -53,8 +57,14 @@ def import_batch(
     fail_after: int | None = None,
     note: str = "",
     batch_id: str | None = None,
+    publish: dict | None = None,
+    pre_commit_check=None,
 ) -> dict:
-    """返回导入结论；不抛业务异常（故障也以 rolled_back 结果返回，便于页面展示）。"""
+    """返回导入结论；不抛业务异常（故障也以 rolled_back 结果返回，便于页面展示）。
+
+    publish 非空时，在同一事务内切换「当前版本指针」；pre_commit_check 是无参回调，
+    返回错误字符串即视为清单核对失败，整体 ROLLBACK，明细与当前版本都保持上一版。
+    """
     existing = store.find_batch_by_sha(conn, sha256)
     rows_before = store.count_rows(conn)
 
@@ -127,7 +137,28 @@ def import_batch(
                 (batch_id, sha256),
             )
 
+        # 原子切换：当前版本指针与明细/聚合在同一事务内更新；
+        # 走到这里之前任何异常都会 ROLLBACK，指针保持指向上一版。
+        if publish is not None:
+            if pre_commit_check is not None:
+                guard_error = pre_commit_check(conn)
+                if guard_error:
+                    raise _GuardRejected(guard_error)
+            store.upsert_published(
+                conn, filename=publish["filename"], file_id=publish["file_id"],
+                version=publish["version"], batch_id=batch_id,
+                total_rows=len(rows),
+            )
+
         conn.execute("COMMIT")
+    except _GuardRejected as exc:
+        conn.execute("ROLLBACK")
+        detail = f"清单核对未通过，整批回滚，当前版本保持上一版：{exc}"
+        store.record_attempt(conn, filename=filename, sha256=sha256, status="rolled_back",
+                             encoding=encoding, error_count=1, row_count=len(rows), detail=detail)
+        return {"status": "guard_rejected", "detail": detail, "batch_id": batch_id,
+                "rows_before": rows_before, "rows_after": rows_before, "written": 0,
+                "error": str(exc)}
     except Exception as exc:  # noqa: BLE001 - 事务失败必须整体回滚
         conn.execute("ROLLBACK")
         rows_after = store.count_rows(conn)

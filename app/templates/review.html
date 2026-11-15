@@ -45,6 +45,49 @@
 
 <div class="split result">
   <div>
+    <section class="panel" id="chunk-panel">
+      <div class="panel-head">
+        <h2>分片续传会话与当前发布版本</h2>
+        <div class="panel-actions"><span class="tag">模块 7/8 · 隔离可追溯 · 一次切换</span></div>
+      </div>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <thead><tr><th>文件</th><th>版本</th><th>状态</th><th class="num">已收/总段</th><th>缺口段号</th><th>批次</th><th>更新时间</th></tr></thead>
+          <tbody>
+            {% for s in chunk_sessions %}
+            <tr>
+              <td><code>{{ s.filename }}</code><br><span class="muted small">{{ s.file_id[:16] }}…</span></td>
+              <td>{{ s.version }}</td>
+              <td><span class="tag {% if s.status in ('quarantined','stale_rejected') %}err{% elif s.status == 'published' %}ok{% else %}warn{% endif %}">{{ s.status }}</span></td>
+              <td class="num">{{ s.received_count }}/{{ s.total_segments }}</td>
+              <td class="small">{% if s.gap %}{{ s.gap|join(', ') }}{% else %}—{% endif %}{% if s.quarantine_reason %}<br><span class="muted">{{ s.quarantine_reason }}</span>{% endif %}</td>
+              <td>{% if s.batch_id %}<a href="/result/{{ s.batch_id }}">{{ s.batch_id }}</a>{% else %}—{% endif %}</td>
+              <td class="small">{{ s.updated_at }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7" class="muted">还没有分片续传会话。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-body tight">
+        <p class="small muted" style="margin:0 0 6px">当前对外发布版本（published_files；切换失败时保留上一版）：</p>
+        <table class="dense">
+          <thead><tr><th>文件</th><th>版本</th><th>file_id</th><th>批次</th><th class="num">行数</th><th>发布时间</th></tr></thead>
+          <tbody>
+            {% for p in published %}
+            <tr><td><code>{{ p.filename }}</code></td><td>{{ p.version }}</td>
+              <td class="small">{{ p.file_id[:16] }}…</td>
+              <td><a href="/result/{{ p.batch_id }}">{{ p.batch_id }}</a></td>
+              <td class="num">{{ p.total_rows }}</td><td class="small">{{ p.published_at }}</td></tr>
+            {% else %}
+            <tr><td colspan="6" class="muted">暂无已发布版本。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="panel">
       <div class="toolbar">
         <input type="search" id="review-search" placeholder="搜索批次 / 文件 / sha256" aria-label="搜索批次">

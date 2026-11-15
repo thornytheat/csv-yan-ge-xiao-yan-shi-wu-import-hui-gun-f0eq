@@ -21,7 +21,6 @@ CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS batches (
   batch_id TEXT PRIMARY KEY,
   filename TEXT NOT NULL,
@@ -74,7 +73,54 @@ CREATE TABLE IF NOT EXISTS import_attempts (
   errors_json TEXT,
   created_at TEXT NOT NULL
 );
+
+-- 分片续传会话：一个文件身份（file_id=完整文件 sha256）至多一条会话
+CREATE TABLE IF NOT EXISTS chunk_sessions (
+  file_id TEXT PRIMARY KEY,
+  filename TEXT NOT NULL,
+  version TEXT NOT NULL,
+  total_size INTEGER NOT NULL,
+  segment_size INTEGER NOT NULL,
+  total_segments INTEGER NOT NULL,
+  total_rows INTEGER NOT NULL,
+  amounts_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  received_count INTEGER NOT NULL DEFAULT 0,
+  quarantine_reason TEXT NOT NULL DEFAULT '',
+  gap_json TEXT NOT NULL DEFAULT '[]',
+  mismatch_json TEXT NOT NULL DEFAULT '[]',
+  batch_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_status ON chunk_sessions(status);
+
+-- 已收片段：先到的片段落这里作为续传依据；(file_id,index) 唯一，重传同段幂等
+CREATE TABLE IF NOT EXISTS chunk_segments (
+  file_id TEXT NOT NULL,
+  segment_index INTEGER NOT NULL,
+  checksum TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  start_offset INTEGER NOT NULL,
+  end_offset INTEGER NOT NULL,
+  stored_path TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (file_id, segment_index)
+);
+
+-- 每个逻辑文件（filename）当前对外发布的版本；切换只改这一行，失败不动它
+CREATE TABLE IF NOT EXISTS published_files (
+  filename TEXT PRIMARY KEY,
+  file_id TEXT NOT NULL,
+  version TEXT NOT NULL,
+  batch_id TEXT NOT NULL,
+  total_rows INTEGER NOT NULL,
+  published_at TEXT NOT NULL
+);
 """
+
+# 分片会话允许的状态
+SESSION_STATUSES = ("open", "quarantined", "published", "stale_rejected")
 
 # 允许的上传策略（避免路由随意传值）
 STATUSES = ("committed", "duplicate_file", "rejected", "encoding_failed", "rolled_back")
@@ -232,3 +278,147 @@ def stats(conn: sqlite3.Connection) -> dict:
     ).fetchone()["c"]
     sites = conn.execute("SELECT COUNT(DISTINCT site) AS c FROM fact_orders").fetchone()["c"]
     return {"batches": batches, "fact_rows": fact, "rejected_attempts": rejected, "sites": sites}
+
+
+# ---------------------------------------------------------------- 分片续传
+
+
+def _session_row_to_dict(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    for key in ("amounts_json", "gap_json", "mismatch_json"):
+        raw = data.pop(key, "[]")
+        try:
+            data[key.replace("_json", "")] = json.loads(raw or "[]")
+        except json.JSONDecodeError:
+            data[key.replace("_json", "")] = []
+    return data
+
+
+def get_session(conn: sqlite3.Connection, file_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM chunk_sessions WHERE file_id = ?", (file_id,)
+    ).fetchone()
+    return _session_row_to_dict(row) if row else None
+
+
+def create_session(conn: sqlite3.Connection, manifest: dict) -> dict:
+    """幂等创建；同 file_id 已存在则直接返回既有会话（重试同一文件不新增批次/会话）。"""
+    existing = get_session(conn, manifest["file_id"])
+    if existing:
+        return existing
+    now = now_iso()
+    conn.execute(
+        "INSERT INTO chunk_sessions(file_id, filename, version, total_size, segment_size,"
+        " total_segments, total_rows, amounts_json, status, received_count,"
+        " quarantine_reason, gap_json, mismatch_json, created_at, updated_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (manifest["file_id"], manifest["filename"], manifest["version"],
+         manifest["total_size"], manifest["segment_size"], manifest["total_segments"],
+         manifest["total_rows"], json.dumps(manifest["amounts"], ensure_ascii=False),
+         "open", 0, "", "[]", "[]", now, now),
+    )
+    return get_session(conn, manifest["file_id"])  # type: ignore[return-value]
+
+
+def touch_session(conn: sqlite3.Connection, file_id: str) -> None:
+    conn.execute(
+        "UPDATE chunk_sessions SET updated_at = ? WHERE file_id = ?",
+        (now_iso(), file_id),
+    )
+
+
+def update_session_status(conn: sqlite3.Connection, file_id: str, status: str, *,
+                          quarantine_reason: str = "", gaps: list | None = None,
+                          mismatches: list | None = None, batch_id: str | None = None) -> None:
+    if status not in SESSION_STATUSES:
+        raise ValueError(f"非法会话状态 {status}")
+    conn.execute(
+        "UPDATE chunk_sessions SET status = ?, quarantine_reason = ?, gap_json = ?,"
+        " mismatch_json = ?, batch_id = COALESCE(?, batch_id), updated_at = ?"
+        " WHERE file_id = ?",
+        (status, quarantine_reason,
+         json.dumps(gaps or [], ensure_ascii=False),
+         json.dumps(mismatches or [], ensure_ascii=False),
+         batch_id, now_iso(), file_id),
+    )
+
+
+def list_sessions(conn: sqlite3.Connection, limit: int = 30) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM chunk_sessions ORDER BY updated_at DESC, file_id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [_session_row_to_dict(r) for r in rows]
+
+
+def get_segment(conn: sqlite3.Connection, file_id: str, index: int) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM chunk_segments WHERE file_id = ? AND segment_index = ?",
+        (file_id, index),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_segments(conn: sqlite3.Connection, file_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM chunk_segments WHERE file_id = ? ORDER BY segment_index ASC",
+        (file_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def received_indexes(conn: sqlite3.Connection, file_id: str) -> list[int]:
+    rows = conn.execute(
+        "SELECT segment_index FROM chunk_segments WHERE file_id = ? ORDER BY segment_index ASC",
+        (file_id,),
+    ).fetchall()
+    return [r["segment_index"] for r in rows]
+
+
+def upsert_segment(conn: sqlite3.Connection, *, file_id: str, index: int, checksum: str,
+                   size_bytes: int, start_offset: int, end_offset: int,
+                   stored_path: str) -> None:
+    """同段重传覆盖（先删旧文件记录再插新），靠主键保证并发下只有一条。"""
+    conn.execute(
+        "INSERT INTO chunk_segments(file_id, segment_index, checksum, size_bytes,"
+        " start_offset, end_offset, stored_path, created_at)"
+        " VALUES(?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(file_id, segment_index) DO UPDATE SET"
+        " checksum=excluded.checksum, size_bytes=excluded.size_bytes,"
+        " start_offset=excluded.start_offset, end_offset=excluded.end_offset,"
+        " stored_path=excluded.stored_path, created_at=excluded.created_at",
+        (file_id, index, checksum, size_bytes, start_offset, end_offset,
+         stored_path, now_iso()),
+    )
+    conn.execute(
+        "UPDATE chunk_sessions SET received_count ="
+        " (SELECT COUNT(*) FROM chunk_segments WHERE file_id = ?), updated_at = ?"
+        " WHERE file_id = ?",
+        (file_id, now_iso(), file_id),
+    )
+
+
+def get_published(conn: sqlite3.Connection, filename: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM published_files WHERE filename = ?", (filename,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_published(conn: sqlite3.Connection, *, filename: str, file_id: str, version: str,
+                     batch_id: str, total_rows: int) -> None:
+    conn.execute(
+        "INSERT INTO published_files(filename, file_id, version, batch_id, total_rows,"
+        " published_at) VALUES(?,?,?,?,?,?)"
+        " ON CONFLICT(filename) DO UPDATE SET file_id=excluded.file_id,"
+        " version=excluded.version, batch_id=excluded.batch_id,"
+        " total_rows=excluded.total_rows, published_at=excluded.published_at",
+        (filename, file_id, version, batch_id, total_rows, now_iso()),
+    )
+
+
+def list_published(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM published_files ORDER BY published_at DESC, filename ASC"
+    ).fetchall()
+    return [dict(r) for r in rows]

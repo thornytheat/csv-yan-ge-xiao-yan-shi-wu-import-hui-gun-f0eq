@@ -69,6 +69,43 @@
     </div>
   </section>
 
+  <section class="panel pane-sticky" id="m7">
+    <div class="panel-head">
+      <h2>分片续传（大文件 / 断网重传）</h2>
+      <div class="panel-actions"><span class="tag">模块 7/8 · 身份核对 · 整批隔离 · 原子切换</span></div>
+    </div>
+    <div class="panel-body">
+      <p class="small muted" style="margin-top:0">
+        浏览器按 <b>完整文件 sha256</b> 确定文件身份，先开续传会话再逐段上传；每段核对段号、覆盖范围与段校验和。
+        缺段或来源不一致会<b>整批隔离</b>并给出缺口，未收齐的内容绝不进入当前结果；收齐后一次性切换明细与站点汇总。
+      </p>
+      <div class="field">
+        <label for="chunk-file">选择 CSV（自动计算 sha256 与分片）</label>
+        <input type="file" id="chunk-file" accept=".csv,text/csv">
+      </div>
+      <div class="field">
+        <label for="chunk-version">来源版本标签 version（较早版本不能改写已发布的较新版本）</label>
+        <input type="text" id="chunk-version" value="v1" placeholder="例如 v1 / 2026-11-15">
+      </div>
+      <div class="field">
+        <label for="chunk-size">每段大小（字节，默认 64KB）</label>
+        <input type="number" id="chunk-size" value="65536" min="256" step="256">
+      </div>
+      <details class="help">
+        <summary>金额清单 amounts（按站点；留空则尝试从文件解析）</summary>
+        <textarea id="chunk-amounts" rows="4" placeholder='[{"site":"beijing","amount_cents":1000,"qty":2,"row_count":1}]'></textarea>
+      </details>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button type="button" id="chunk-upload-btn">分片上传并续传</button>
+        <button type="button" class="secondary" id="chunk-finalize-btn">收齐后核对并切换</button>
+        <button type="button" class="secondary" id="chunk-status-btn">查询会话状态</button>
+      </div>
+      <div id="chunk-progress" class="small" style="margin-top:10px"></div>
+      <div id="chunk-result" class="small" style="margin-top:10px"></div>
+      <div id="chunk-error" class="alert alert-error" hidden></div>
+    </div>
+  </section>
+
   <div>
     <div class="kpi-strip">
       <div class="kpi">
